@@ -1,3 +1,5 @@
+![](simavr-running-riscv-emulator-act-test.png)
+
 # RISC-V-emulator-SimAVR
 
 simavr-host: a simavr wrapper that runs AVR firmware (Intel HEX) on an atmega1284p core and executes the RISC-V ACT tests via a VPI peripheral.
