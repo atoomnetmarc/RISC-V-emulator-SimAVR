@@ -1,0 +1,9 @@
+# PlatformIO
+*_env_local.ini
+.pio
+
+# Visual Studio Code
+.vscode
+
+binaries
+
