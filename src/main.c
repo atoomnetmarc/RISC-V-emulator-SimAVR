@@ -6,6 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 #define _POSIX_C_SOURCE 199309L
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <termios.h>
 #include <unistd.h>
@@ -65,20 +66,31 @@ static void msgf(const char *fmt, ...) {
 }
 
 // Put stdin in raw, non-blocking mode so typed characters reach the
-// emulated UART immediately. Restored by stdin_restore().
+// emulated UART immediately. Only applies when stdin is a terminal;
+// restored by stdin_restore() on every exit path, including signals.
 static struct termios orig_termios;
+static int stdin_is_tty = 0;
+
+static void stdin_restore(void) {
+    if (stdin_is_tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    }
+}
 
 static void stdin_raw_enable(void) {
+    stdin_is_tty = isatty(STDIN_FILENO);
+    if (!stdin_is_tty) {
+        return;
+    }
     tcgetattr(STDIN_FILENO, &orig_termios);
     struct termios term = orig_termios;
     term.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &term);
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-}
-
-static void stdin_restore(void) {
-    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+    atexit(stdin_restore);
+    signal(SIGINT, exit);
+    signal(SIGTERM, exit);
 }
 
 int main(int argc, char *argv[]) {
