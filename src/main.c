@@ -240,6 +240,14 @@ static void stdin_restore(void) {
 }
 
 static void stdin_raw_enable(void) {
+    // The run loop polls stdin with read() every UART_STDIN_POLL_INTERVAL
+    // iterations. Piped stdin must be non-blocking too, otherwise a read()
+    // with no data available stalls the whole simulation.
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+    }
+
     stdin_is_tty = isatty(STDIN_FILENO);
     if (!stdin_is_tty) {
         return;
@@ -248,8 +256,6 @@ static void stdin_raw_enable(void) {
     struct termios term = orig_termios;
     term.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &term);
-    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
-    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     atexit(stdin_restore);
     signal(SIGINT, exit);
     signal(SIGTERM, exit);
