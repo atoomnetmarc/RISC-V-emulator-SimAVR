@@ -3,11 +3,12 @@ Copyright Marc Ketel
 SPDX-License-Identifier: Apache-2.0
 */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -24,18 +25,32 @@ SPDX-License-Identifier: Apache-2.0
 
 #include "vpi.h"
 
-#define RAM_LENGTH 0x1000000
+#define RAM_ORIGIN  0x80000000u
+#define RAM_LENGTH  0x4000000u
+#define DTB_ADDRESS 0x82200000u
+#define MAX_LOADS   8
 
 static avr_t *avr = NULL;
 static vpi_t vpi;
 int verbose = 0; // non-static: also read by vpi.c
 
-#define RUN_TIMEOUT_SECONDS  300
 #define BREAK_LOOP_THRESHOLD 1000
 
+static unsigned run_timeout_seconds = 0;
 // How often (in avr_run() iterations) the run loop polls stdin. A syscall
 // per iteration slows the simulation drastically.
 #define UART_STDIN_POLL_INTERVAL 4096
+
+static struct {
+    uint32_t address;
+    const char *path;
+} loads[MAX_LOADS];
+static size_t load_count = 0;
+static const char *dtbpath = NULL;
+static const char *diskpath = NULL;
+static const char *tappath = NULL;
+static int disk_fd = -1;
+static int tap_fd = -1;
 
 static void uart_tx_hook(struct avr_irq_t *irq, uint32_t value, void *param) {
     (void)irq;
@@ -56,6 +71,9 @@ static void bad_opcode_hook(struct avr_irq_t *irq, uint32_t value, void *param) 
     bad_opcode = 1;
 }
 
+/**
+ * Prints host diagnostics.
+ */
 static void msgf(const char *fmt, ...) {
     fputc('\n', stderr);
     fputs("[simavr-host] ", stderr);
@@ -65,9 +83,9 @@ static void msgf(const char *fmt, ...) {
     va_end(ap);
 }
 
-// Put stdin in raw, non-blocking mode so typed characters reach the
-// emulated UART immediately. Only applies when stdin is a terminal;
-// restored by stdin_restore() on every exit path, including signals.
+// Put stdin in raw, non-blocking mode so typed characters reach the emulated
+// UART immediately. Only applies when stdin is a terminal; restored by
+// stdin_restore() on every exit path, including signals.
 static struct termios orig_termios;
 static int stdin_is_tty = 0;
 
@@ -93,19 +111,88 @@ static void stdin_raw_enable(void) {
     signal(SIGTERM, exit);
 }
 
+static int load_image(uint8_t *memory, uint32_t address, const char *path) {
+    if (address < RAM_ORIGIN || address >= RAM_ORIGIN + RAM_LENGTH) {
+        msgf("Error: load address 0x%08X is outside RAM\n", address);
+        return 0;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        msgf("Error: file not found: %s\n", path);
+        return 0;
+    }
+    size_t offset = (size_t)(address - RAM_ORIGIN);
+    size_t size = fread(&memory[offset], 1, (size_t)RAM_LENGTH - offset, file);
+    if (ferror(file)) {
+        fclose(file);
+        msgf("Error reading %s\n", path);
+        return 0;
+    }
+    fclose(file);
+    if (verbose) {
+        msgf("Loaded %zu bytes at 0x%08X from %s\n", size, address, path);
+    }
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] != '\0') {
         if (strcmp(argv[argi], "-v") == 0) {
             verbose = 1;
             argi++;
+        } else if (strcmp(argv[argi], "-l") == 0 && argi + 1 < argc) {
+            argi++;
+            char *end;
+            unsigned long address = strtoul(argv[argi], &end, 0);
+            if (*end != ',' || end[1] == '\0') {
+                msgf("Error: -l requires <address>,<file>, got %s\n", argv[argi]);
+                return EXIT_FAILURE;
+            }
+            if (load_count == MAX_LOADS) {
+                msgf("Error: at most %d -l options are supported\n", MAX_LOADS);
+                return EXIT_FAILURE;
+            }
+            loads[load_count].address = (uint32_t)address;
+            loads[load_count].path = end + 1;
+            load_count++;
+            argi++;
+        } else if (strcmp(argv[argi], "-b") == 0 && argi + 1 < argc) {
+            argi++;
+            char *end;
+            unsigned long address = strtoul(argv[argi], &end, 0);
+            if (*end == ',') {
+                if (address != DTB_ADDRESS) {
+                    msgf("Error: the firmware expects the DTB at 0x%08X\n", DTB_ADDRESS);
+                    return EXIT_FAILURE;
+                }
+                dtbpath = end + 1;
+            } else {
+                dtbpath = argv[argi];
+            }
+            argi++;
+        } else if (strcmp(argv[argi], "-D") == 0 && argi + 1 < argc) {
+            diskpath = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "-N") == 0 && argi + 1 < argc) {
+            tappath = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "-T") == 0 && argi + 1 < argc) {
+            char *end;
+            unsigned long seconds = strtoul(argv[argi + 1], &end, 10);
+            if (*end != '\0' || seconds == 0) {
+                msgf("Error: -T requires a positive number of seconds\n");
+                return EXIT_FAILURE;
+            }
+            run_timeout_seconds = (unsigned)seconds;
+            argi += 2;
         } else {
             msgf("Error: unknown option: %s\n", argv[argi]);
             return EXIT_FAILURE;
         }
     }
     if (argc - argi < 1 || argc - argi > 2) {
-        msgf("Usage: %s [-v] <firmware.hex> [<test.bin>]\n", argv[0]);
+        msgf("Usage: %s [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-T <seconds>] <firmware.hex> [<test.bin>]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const char *firmware_hex = argv[argi];
@@ -121,22 +208,55 @@ int main(int argc, char *argv[]) {
 
     uint8_t *memory = malloc(RAM_LENGTH);
     if (memory == NULL) {
-        msgf("Error: failed to allocate %d bytes of RISC-V RAM\n", RAM_LENGTH);
+        msgf("Error: failed to allocate %u bytes of RISC-V RAM\n", RAM_LENGTH);
         return EXIT_FAILURE;
     }
     memset(memory, 0, RAM_LENGTH);
     vpi_init(avr, &vpi);
-    vpi_set_memory(&vpi, memory);
+    vpi_set_memory(&vpi, memory, RAM_LENGTH);
 
-    if (testbin != NULL) {
-        FILE *fbin = fopen(testbin, "rb");
-        if (fbin == NULL) {
-            msgf("Error: file not found: %s\n", testbin);
+    if (testbin != NULL && !load_image(memory, RAM_ORIGIN, testbin)) {
+        free(memory);
+        return EXIT_FAILURE;
+    }
+    for (size_t i = 0; i < load_count; i++) {
+        if (!load_image(memory, loads[i].address, loads[i].path)) {
+            free(memory);
             return EXIT_FAILURE;
         }
-        size_t binsize = fread(memory, 1, RAM_LENGTH, fbin);
-        fclose(fbin);
-        msgf("Loaded %zu bytes of test binary into VPI RAM\n", binsize);
+    }
+    if (dtbpath != NULL && !load_image(memory, DTB_ADDRESS, dtbpath)) {
+        free(memory);
+        return EXIT_FAILURE;
+    }
+    if (diskpath != NULL) {
+        disk_fd = open(diskpath, O_RDWR);
+        if (disk_fd < 0) {
+            msgf("Error: cannot open disk %s\n", diskpath);
+            free(memory);
+            return EXIT_FAILURE;
+        }
+        struct stat st;
+        if (fstat(disk_fd, &st) != 0 || st.st_size <= 0 || (st.st_size % 512) != 0) {
+            msgf("Error: disk size must be a positive multiple of 512 bytes\n");
+            close(disk_fd);
+            free(memory);
+            return EXIT_FAILURE;
+        }
+        vpi_set_disk(&vpi, disk_fd, (uint64_t)st.st_size / 512u);
+    }
+
+    if (tappath != NULL) {
+        tap_fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+        if (tap_fd < 0) {
+            msgf("Error: cannot open /dev/net/tun\n");
+            if (disk_fd >= 0) {
+                close(disk_fd);
+            }
+            free(memory);
+            return EXIT_FAILURE;
+        }
+        vpi_set_tap(&vpi, tap_fd);
     }
 
     elf_firmware_t firmware;
@@ -189,13 +309,14 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
-        // Feed any typed characters into the emulated UART. Polling stdin on
-        // every avr_run() call slows the simulation drastically, so only do
-        // it once every UART_STDIN_POLL_INTERVAL iterations.
+        // Feed any typed characters into the emulated UART and the VPI
+        // receive buffer. Polling stdin on every avr_run() call slows the
+        // simulation drastically, so only do it once every interval.
         if (++run_iterations % UART_STDIN_POLL_INTERVAL == 0) {
             uint8_t ch;
             while (read(STDIN_FILENO, &ch, 1) == 1) {
                 avr_raise_irq(uart0_rx, ch);
+                vpi_rx_push(&vpi, ch);
             }
         }
         if (bad_opcode) {
@@ -228,8 +349,8 @@ int main(int argc, char *argv[]) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         double elapsed = (double)(now.tv_sec - start.tv_sec) +
                          (double)(now.tv_nsec - start.tv_nsec) / 1e9;
-        if (elapsed >= RUN_TIMEOUT_SECONDS) {
-            msgf("Error: run loop timed out after %d s\n", RUN_TIMEOUT_SECONDS);
+        if (run_timeout_seconds != 0 && elapsed >= (double)run_timeout_seconds) {
+            msgf("Error: run loop timed out after %u s\n", run_timeout_seconds);
             timed_out = 1;
             break;
         }
@@ -243,11 +364,17 @@ int main(int argc, char *argv[]) {
          (unsigned long long)avr->cycle, (double)avr->cycle / 20000000.0);
 
     free(memory);
+    if (disk_fd >= 0) {
+        close(disk_fd);
+    }
+    if (tap_fd >= 0) {
+        close(tap_fd);
+    }
 
     if (timed_out) {
         return EXIT_FAILURE;
     }
-    if (testbin == NULL) {
+    if (testbin == NULL && dtbpath == NULL && load_count == 0) {
         return EXIT_SUCCESS;
     }
     if (!vpi.halted) {

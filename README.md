@@ -6,25 +6,15 @@ simavr-host: a simavr wrapper that runs AVR firmware (Intel HEX) on an atmega128
 
 ## How it works
 
-- **[`src/main.c`](src/main.c)** — host wrapper. Loads the firmware, taps the UART0 TX IRQ (every transmitted byte goes to stdout) and runs the simulation. With a `<test.bin>` the RISC-V test binary is loaded into the 16 MiB host RAM of the VPI peripheral (byte 0 = RISC-V address 0x80000000); the exit code is then the test result (0 = pass, 1 = fail). Without a test binary: smoke test. The simulation stops on power-down sleep, a BREAK halt loop (opcode 0x9598, detected via a repeating 2-instruction PC cycle) or a 25 s wall-clock timeout. `-v` enables verbose output on stderr.
-- **[`src/vpi.c`](src/vpi.c) / [`src/vpi.h`](src/vpi.h)** — VPI peripheral: a pure memory device that backs the RISC-V RAM with host memory and carries the test exit status. Register contract (IO addresses, free in iom1284p.h and the simavr atmega1284p core, < 0x60 for 1-cycle `in`/`out`):
-
-  | Addr | Register | Function                                       |
-  | ---- | -------- | ---------------------------------------------- |
-  | 0x31 | ADDR_LO  | bits 0–7 of the 24-bit RAM offset              |
-  | 0x32 | ADDR_MID | bits 8–15                                      |
-  | 0x33 | ADDR_HI  | bits 16–23                                     |
-  | 0x34 | DATA     | byte read/write; every access auto-increments  |
-  | 0x39 | EXIT     | exit status: 0x00 = pass, else fail; stops sim |
-
-  24-bit addressing because the largest ACT test binary (139392 bytes) exceeds a 16-bit window. The firmware computes offset = address − 0x80000000.
+- **[`src/main.c`](src/main.c)** — host wrapper. Loads the firmware, taps the UART0 TX IRQ (every transmitted byte goes to stdout) and runs the simulation. The VPI peripheral holds 64 MiB of host RAM at RISC-V address `0x80000000`. `-l <address>,<file>` loads an image at a physical address and is repeatable; `-b <file>` loads the DTB at `0x82200000`; `-D <file>` attaches a disk; `-N <ifname>` attaches a TAP interface; `-T <seconds>` sets a wall-clock timeout. Without `-T` the run has no timeout. A positional `<test.bin>` loads at `0x80000000`. The simulation stops on power-down sleep, a BREAK halt loop (opcode 0x9598, detected via a repeating 2-instruction PC cycle), a VPI exit or the timeout. `-v` enables verbose output on stderr.
+- **[`src/vpi.c`](src/vpi.c) / [`src/vpi.h`](src/vpi.h)** — VPI peripheral: backs the RISC-V RAM with host memory, carries the exit status and services synchronous host calls from the AVR firmware. The full register and call contract is in [`docs/vpi-host-calls.md`](docs/vpi-host-calls.md). The address is 32-bit; the firmware computes offset = address − 0x80000000.
 
 ## Usage
 
 ```
-pio run -e simavr-host && .pio/build/simavr-host/simavr-host firmware.hex [test.bin]
+pio run -e simavr-host && .pio/build/simavr-host/simavr-host [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-S <prefix>] [-R <prefix>] [-T <seconds>] <firmware.hex> [<test.bin>]
 ```
 
-`firmware.hex` is the AVR firmware (Intel HEX) that runs on the simulated atmega1284p and drives the RISC-V emulator. `test.bin` is the optional RISC-V test binary loaded into the VPI RAM; its exit code is the test result.
+`firmware.hex` is the AVR firmware (Intel HEX) that runs on the simulated atmega1284p and drives the RISC-V emulator. `test.bin` is the optional RISC-V test binary loaded at `0x80000000`; its exit code is the test result. For a Linux boot, load OpenSBI and U-Boot with `-l` and pass the DTB with `-b`.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
