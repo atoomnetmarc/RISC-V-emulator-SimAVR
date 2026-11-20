@@ -40,6 +40,7 @@ static avr_io_addr_t vpi_addr_space = VPI_SPACE;
 static avr_io_addr_t vpi_addr_rx_len = VPI_RX_LEN;
 static avr_io_addr_t vpi_addr_rx_data = VPI_RX_DATA;
 static avr_io_addr_t vpi_addr_exit = VPI_EXIT;
+static avr_io_addr_t vpi_addr_snapshot = VPI_SNAPSHOT;
 
 static void store_u64_le(uint8_t *destination, uint64_t value) {
     for (uint8_t i = 0; i < 8; i++) {
@@ -186,6 +187,10 @@ static void execute_call(vpi_t *vpi, uint8_t code) {
             store_u64_le(vpi->result, vpi->disk_capacity);
             break;
 
+        case VPI_CALL_STATE_SAVE:
+            vpi->snapshot_ready = 1;
+            break;
+
         default:
             vpi->status = VPI_STATUS_ERROR;
             if (verbose) {
@@ -238,6 +243,9 @@ static uint8_t vpi_read(struct avr_t *avr, avr_io_addr_t addr, void *param) {
         uint8_t value = vpi->rx[vpi->rx_head];
         vpi->rx_head = (uint16_t)((vpi->rx_head + 1u) % VPI_RX_SIZE);
         return value;
+    }
+    if (addr == vpi_addr_snapshot) {
+        return vpi->snapshot_request;
     }
     return 0;
 }
@@ -293,6 +301,10 @@ static void vpi_write(struct avr_t *avr, avr_io_addr_t addr, uint8_t value, void
         }
         return;
     }
+    if (addr == vpi_addr_snapshot) {
+        vpi->snapshot_request = value;
+        return;
+    }
 }
 
 static const char *irq_names[] = {NULL};
@@ -311,6 +323,8 @@ void vpi_init(avr_t *avr, vpi_t *vpi) {
     vpi->status = VPI_STATUS_IDLE;
     vpi->exit_status = 0xff;
     vpi->halted = 0;
+    vpi->snapshot_request = 0;
+    vpi->snapshot_ready = 0;
     vpi->rx_head = 0;
     vpi->rx_tail = 0;
     vpi->disk_fd = -1;
@@ -336,6 +350,8 @@ void vpi_init(avr_t *avr, vpi_t *vpi) {
     avr_register_io_write(avr, vpi_addr_call, vpi_write, vpi);
     avr_register_io_write(avr, vpi_addr_space, vpi_write, vpi);
     avr_register_io_write(avr, vpi_addr_exit, vpi_write, vpi);
+    avr_register_io_read(avr, vpi_addr_snapshot, vpi_read, vpi);
+    avr_register_io_write(avr, vpi_addr_snapshot, vpi_write, vpi);
 }
 
 void vpi_set_memory(vpi_t *vpi, uint8_t *memory, uint32_t size) {
@@ -363,4 +379,14 @@ void vpi_rx_push(vpi_t *vpi, uint8_t byte) {
 
 uint8_t vpi_get_exit_status(const vpi_t *vpi) {
     return vpi->exit_status;
+}
+
+void vpi_set_snapshot_request(vpi_t *vpi, uint8_t request) {
+    vpi->snapshot_request = request;
+}
+
+uint8_t vpi_take_snapshot_ready(vpi_t *vpi) {
+    uint8_t ready = vpi->snapshot_ready;
+    vpi->snapshot_ready = 0;
+    return ready;
 }

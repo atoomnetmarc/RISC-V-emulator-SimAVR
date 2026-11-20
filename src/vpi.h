@@ -22,6 +22,7 @@ SPDX-License-Identifier: Apache-2.0
 #define VPI_RX_LEN   0x3E
 #define VPI_RX_DATA  0x3F
 #define VPI_EXIT     0x39
+#define VPI_SNAPSHOT 0x62
 
 #define VPI_EXIT_PASS   0x00
 #define VPI_EXIT_FAIL   0x01
@@ -45,6 +46,7 @@ SPDX-License-Identifier: Apache-2.0
 #define VPI_CALL_RTC_MONOTONIC 9
 #define VPI_CALL_TIME_SOURCE   10
 #define VPI_CALL_DISK_CAPACITY 11
+#define VPI_CALL_STATE_SAVE    12
 
 #define VPI_SCRATCH_SIZE 4096
 #define VPI_RX_SIZE      1024
@@ -66,6 +68,8 @@ typedef struct {
     uint8_t status;
     uint8_t exit_status;
     uint8_t halted;
+    uint8_t snapshot_request;
+    uint8_t snapshot_ready;
     uint8_t rx[VPI_RX_SIZE];
     uint16_t rx_head;
     uint16_t rx_tail;
@@ -80,5 +84,7 @@ void vpi_set_disk(vpi_t *vpi, int fd, uint64_t capacity);
 void vpi_set_tap(vpi_t *vpi, int fd);
 void vpi_rx_push(vpi_t *vpi, uint8_t byte);
 uint8_t vpi_get_exit_status(const vpi_t *vpi);
+void vpi_set_snapshot_request(vpi_t *vpi, uint8_t request);
+uint8_t vpi_take_snapshot_ready(vpi_t *vpi);
 
 #endif /* VPI_H_ */

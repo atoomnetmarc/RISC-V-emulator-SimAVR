@@ -20,6 +20,7 @@ The addresses are IO addresses as used by simavr's `avr_register_io_read()` and 
 | 0x3E | RX_LEN | R | number of bytes available in the receive buffer |
 | 0x3F | RX_DATA | R | reads one receive byte and decrements RX_LEN |
 | 0x39 | EXIT | W | exit status; stops simavr |
+| 0x62 | SNAPSHOT | R/W | 0 = no request, 1 = save state, 2 = load state; the firmware clears it |
 
 `SPACE` selects the target of `ADDR`/`DATA`. Guest RAM is 64 MiB at RISC-V address `0x80000000`; the offset is the RISC-V address minus `0x80000000`. The scratch buffer is 4096 bytes on the host and is used for bulk data that must not consume guest RAM.
 
@@ -50,8 +51,11 @@ Multi-byte values are little-endian.
 | 9 | RTC_MONOTONIC | - | ns: u64 | - |
 | 10 | TIME_SOURCE | - | us: u64 | - |
 | 11 | DISK_CAPACITY | - | sectors: u64 | - |
+| 12 | STATE_SAVE | - | - | notifies the host that the state blob is ready in guest RAM |
 
 `TIME_SOURCE` returns the CLINT `mtime` in microseconds. `DISK_CAPACITY` returns the number of 512-byte sectors of the attached disk. The SYSCON device writes `EXIT` on guest poweroff and reboot: `0x00` for a successful poweroff, `0x01` for a failed poweroff and `0x02` for a reboot. The host treats only `0x00` as a passing exit.
+
+The host writes `SNAPSHOT` to request a state transfer. For a save, the firmware writes a magic word, the blob length and the packed state blob to the last 4 KiB of guest RAM at `0x83FFF000`, then writes call `STATE_SAVE`. The host reads the blob from its own RAM copy and writes the JSON and RAM snapshot files. For a load, the host writes the same area and sets `SNAPSHOT` to 2; the firmware applies the blob and clears the register. The DTB declares RAM up to `0x83FFF000`, so the area is outside the guest-visible range.
 
 ## Receive path
 

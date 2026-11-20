@@ -23,6 +23,8 @@ SPDX-License-Identifier: Apache-2.0
 #include <simavr/sim_elf.h>
 #include <simavr/sim_hex.h>
 
+#include <RiscvEmulatorSnapshot.h>
+
 #include "vpi.h"
 
 #define RAM_ORIGIN  0x80000000u
@@ -37,6 +39,10 @@ int verbose = 0; // non-static: also read by vpi.c
 #define BREAK_LOOP_THRESHOLD 1000
 
 static unsigned run_timeout_seconds = 0;
+static const char *snapshot_prefix = NULL;
+static const char *restore_prefix = NULL;
+static volatile sig_atomic_t snapshot_requested = 0;
+
 // How often (in avr_run() iterations) the run loop polls stdin. A syscall
 // per iteration slows the simulation drastically.
 #define UART_STDIN_POLL_INTERVAL 4096
@@ -69,6 +75,144 @@ static void bad_opcode_hook(struct avr_irq_t *irq, uint32_t value, void *param) 
     (void)value;
     (void)param;
     bad_opcode = 1;
+}
+
+static void msgf(const char *fmt, ...);
+
+/**
+ * Requests a snapshot from the SIGUSR1 handler.
+ */
+static void snapshot_signal_handler(int signal_number) {
+    (void)signal_number;
+    snapshot_requested = 1;
+}
+
+/**
+ * Writes the snapshot blob and guest RAM to disk.
+ */
+static void snapshot_save(const uint8_t *memory) {
+    char json_path[1024];
+    char ram_path[1024];
+    char json_tmp[1024];
+    char ram_tmp[1024];
+    if (snprintf(json_path, sizeof(json_path), "%s.json", snapshot_prefix) >= (int)sizeof(json_path) ||
+        snprintf(ram_path, sizeof(ram_path), "%s.bin", snapshot_prefix) >= (int)sizeof(ram_path) ||
+        snprintf(json_tmp, sizeof(json_tmp), "%s.json.tmp", snapshot_prefix) >= (int)sizeof(json_tmp) ||
+        snprintf(ram_tmp, sizeof(ram_tmp), "%s.bin.tmp", snapshot_prefix) >= (int)sizeof(ram_tmp)) {
+        msgf("Snapshot path is too long: %s\n", snapshot_prefix);
+        return;
+    }
+
+    uint32_t offset = RVE_SNAPSHOT_META_ADDRESS - RAM_ORIGIN;
+    uint32_t magic = 0;
+    uint32_t length = 0;
+    memcpy(&magic, &memory[offset], sizeof(magic));
+    memcpy(&length, &memory[offset + 4u], sizeof(length));
+    if (magic != 0x5256534Eu || length != sizeof(rve_snapshot_t)) {
+        msgf("Snapshot blob is not ready in guest RAM\n");
+        return;
+    }
+    rve_snapshot_t blob;
+    memcpy(&blob, &memory[offset + 8u], sizeof(blob));
+    if (blob.magic != RVE_SNAPSHOT_MAGIC || blob.version != RVE_SNAPSHOT_VERSION) {
+        msgf("Snapshot blob has an incompatible header\n");
+        return;
+    }
+
+    FILE *json = fopen(json_tmp, "w");
+    if (json == NULL) {
+        msgf("Cannot write %s\n", json_tmp);
+        return;
+    }
+    FILE *ram = fopen(ram_tmp, "wb");
+    if (ram == NULL) {
+        msgf("Cannot write %s\n", ram_tmp);
+        fclose(json);
+        remove(json_tmp);
+        return;
+    }
+    rve_snapshot_json_write(json, &blob);
+    if (fclose(json) != 0 || fwrite(memory, 1, RAM_LENGTH, ram) != RAM_LENGTH || fclose(ram) != 0) {
+        msgf("Cannot write snapshot files for %s\n", snapshot_prefix);
+        remove(json_tmp);
+        remove(ram_tmp);
+        return;
+    }
+    if (rename(json_tmp, json_path) != 0 || rename(ram_tmp, ram_path) != 0) {
+        msgf("Cannot install snapshot files for %s\n", snapshot_prefix);
+        remove(json_tmp);
+        remove(ram_tmp);
+        return;
+    }
+    msgf("Snapshot written to %s and %s after %llu instructions\n", json_path, ram_path,
+         (unsigned long long)blob.instructions);
+}
+
+/**
+ * Loads a snapshot into guest RAM and asks the firmware to restore its state.
+ */
+static void snapshot_load(uint8_t *memory) {
+    char json_path[1024];
+    char ram_path[1024];
+    if (snprintf(json_path, sizeof(json_path), "%s.json", restore_prefix) >= (int)sizeof(json_path) ||
+        snprintf(ram_path, sizeof(ram_path), "%s.bin", restore_prefix) >= (int)sizeof(ram_path)) {
+        msgf("Snapshot path is too long: %s\n", restore_prefix);
+        return;
+    }
+    FILE *json = fopen(json_path, "r");
+    if (json == NULL) {
+        msgf("Cannot read %s\n", json_path);
+        return;
+    }
+    if (fseek(json, 0, SEEK_END) != 0) {
+        fclose(json);
+        return;
+    }
+    long size = ftell(json);
+    if (size <= 0 || size > 1024 * 1024 || fseek(json, 0, SEEK_SET) != 0) {
+        fclose(json);
+        return;
+    }
+    char *text = malloc((size_t)size + 1u);
+    if (text == NULL || fread(text, 1, (size_t)size, json) != (size_t)size) {
+        free(text);
+        fclose(json);
+        return;
+    }
+    text[size] = '\0';
+    fclose(json);
+
+    rve_snapshot_t blob;
+    memset(&blob, 0, sizeof(blob));
+    bool ok = rve_snapshot_json_read(text, &blob);
+    free(text);
+    if (!ok || blob.magic != RVE_SNAPSHOT_MAGIC || blob.version != RVE_SNAPSHOT_VERSION ||
+        blob.ram_origin != RAM_ORIGIN || blob.ram_size != RAM_LENGTH) {
+        msgf("Snapshot %s has an incompatible header\n", json_path);
+        return;
+    }
+
+    FILE *ram = fopen(ram_path, "rb");
+    if (ram == NULL) {
+        msgf("Cannot read %s\n", ram_path);
+        return;
+    }
+    size_t got = fread(memory, 1, RAM_LENGTH, ram);
+    fclose(ram);
+    if (got != RAM_LENGTH) {
+        msgf("Snapshot RAM %s has %zu bytes, expected %u\n", ram_path, got, RAM_LENGTH);
+        return;
+    }
+
+    uint32_t offset = RVE_SNAPSHOT_META_ADDRESS - RAM_ORIGIN;
+    uint32_t magic = 0x5256534Eu;
+    uint32_t length = sizeof(blob);
+    memcpy(&memory[offset], &magic, sizeof(magic));
+    memcpy(&memory[offset + 4u], &length, sizeof(length));
+    memcpy(&memory[offset + 8u], &blob, sizeof(blob));
+    vpi_set_snapshot_request(&vpi, 2);
+    msgf("Restored snapshot %s at %llu instructions, pc=0x%08X\n", json_path,
+         (unsigned long long)blob.instructions, blob.cpu_pc);
 }
 
 /**
@@ -177,6 +321,12 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[argi], "-N") == 0 && argi + 1 < argc) {
             tappath = argv[argi + 1];
             argi += 2;
+        } else if (strcmp(argv[argi], "-S") == 0 && argi + 1 < argc) {
+            snapshot_prefix = argv[argi + 1];
+            argi += 2;
+        } else if (strcmp(argv[argi], "-R") == 0 && argi + 1 < argc) {
+            restore_prefix = argv[argi + 1];
+            argi += 2;
         } else if (strcmp(argv[argi], "-T") == 0 && argi + 1 < argc) {
             char *end;
             unsigned long seconds = strtoul(argv[argi + 1], &end, 10);
@@ -192,7 +342,7 @@ int main(int argc, char *argv[]) {
         }
     }
     if (argc - argi < 1 || argc - argi > 2) {
-        msgf("Usage: %s [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-T <seconds>] <firmware.hex> [<test.bin>]\n", argv[0]);
+        msgf("Usage: %s [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-S <prefix>] [-R <prefix>] [-T <seconds>] <firmware.hex> [<test.bin>]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const char *firmware_hex = argv[argi];
@@ -229,6 +379,20 @@ int main(int argc, char *argv[]) {
         free(memory);
         return EXIT_FAILURE;
     }
+    if (restore_prefix != NULL) {
+        snapshot_load(memory);
+    }
+    if (snapshot_prefix != NULL) {
+        struct sigaction action = {0};
+        action.sa_handler = snapshot_signal_handler;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGUSR1, &action, NULL) != 0) {
+            msgf("Cannot install the SIGUSR1 handler\n");
+            free(memory);
+            return EXIT_FAILURE;
+        }
+    }
+
     if (diskpath != NULL) {
         disk_fd = open(diskpath, O_RDWR);
         if (disk_fd < 0) {
@@ -301,6 +465,15 @@ int main(int argc, char *argv[]) {
     unsigned long run_iterations = 0;
     stdin_raw_enable();
     for (;;) {
+        if (vpi_take_snapshot_ready(&vpi) != 0 && snapshot_prefix != NULL) {
+            snapshot_save(memory);
+        }
+        if (snapshot_requested != 0) {
+            snapshot_requested = 0;
+            if (snapshot_prefix != NULL) {
+                vpi_set_snapshot_request(&vpi, 1);
+            }
+        }
         int state = avr_run(avr);
         if (state == cpu_Sleeping || state == cpu_Crashed || state == cpu_Done) {
             if (verbose) {
