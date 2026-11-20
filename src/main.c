@@ -8,6 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -233,6 +234,10 @@ static void msgf(const char *fmt, ...) {
 static struct termios orig_termios;
 static int stdin_is_tty = 0;
 
+// Ctrl-C forwarding set by -C: the guest receives 0x03 instead of the host
+// terminating on SIGINT.
+static bool kbd_interrupt_forward;
+
 static void stdin_restore(void) {
     if (stdin_is_tty) {
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
@@ -255,9 +260,14 @@ static void stdin_raw_enable(void) {
     tcgetattr(STDIN_FILENO, &orig_termios);
     struct termios term = orig_termios;
     term.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    if (kbd_interrupt_forward) {
+        term.c_lflag &= ~(tcflag_t)ISIG;
+    }
     tcsetattr(STDIN_FILENO, TCSANOW, &term);
     atexit(stdin_restore);
-    signal(SIGINT, exit);
+    if (!kbd_interrupt_forward) {
+        signal(SIGINT, exit);
+    }
     signal(SIGTERM, exit);
 }
 
@@ -342,13 +352,16 @@ int main(int argc, char *argv[]) {
             }
             run_timeout_seconds = (unsigned)seconds;
             argi += 2;
+        } else if (strcmp(argv[argi], "-C") == 0) {
+            kbd_interrupt_forward = true;
+            argi++;
         } else {
             msgf("Error: unknown option: %s\n", argv[argi]);
             return EXIT_FAILURE;
         }
     }
     if (argc - argi < 1 || argc - argi > 2) {
-        msgf("Usage: %s [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-S <prefix>] [-R <prefix>] [-T <seconds>] <firmware.hex> [<test.bin>]\n", argv[0]);
+        msgf("Usage: %s [-v] [-l <address>,<file>] [-b <file>] [-D <disk>] [-N <ifname>] [-S <prefix>] [-R <prefix>] [-T <seconds>] [-C] <firmware.hex> [<test.bin>]\n", argv[0]);
         return EXIT_FAILURE;
     }
     const char *firmware_hex = argv[argi];
@@ -481,6 +494,9 @@ int main(int argc, char *argv[]) {
             }
         }
         int state = avr_run(avr);
+        if (vpi.halted) {
+            break;
+        }
         if (state == cpu_Sleeping || state == cpu_Crashed || state == cpu_Done) {
             if (verbose) {
                 msgf("Verbose: run loop ended with CPU state %d at pc 0x%04x\n",
