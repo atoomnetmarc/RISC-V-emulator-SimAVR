@@ -43,10 +43,22 @@ static unsigned run_timeout_seconds = 0;
 static const char *snapshot_prefix = NULL;
 static const char *restore_prefix = NULL;
 static volatile sig_atomic_t snapshot_requested = 0;
+static volatile sig_atomic_t dump_requested = 0;
+static int dump_pending = 0;
 
 // How often (in avr_run() iterations) the run loop polls stdin. A syscall
-// per iteration slows the simulation drastically.
-#define UART_STDIN_POLL_INTERVAL 4096
+// per iteration slows the simulation; this interval keeps input responsive.
+#define UART_STDIN_POLL_INTERVAL 256
+
+// Maximum bytes moved per poll. One byte per poll keeps the guest FIFO below
+// its 16-byte limit even when the flow-control signal lags a poll behind.
+#define UART_STDIN_BURST 1
+
+// Control characters pass through the flow-control pause so Ctrl-C can stop a
+// running demo even while the guest is not draining its receive FIFO.
+#define UART_CTRL_C     0x03u
+#define UART_CTRL_D     0x04u
+#define UART_CTRL_ENTER 0x0au
 
 static struct {
     uint32_t address;
@@ -64,6 +76,29 @@ static void uart_tx_hook(struct avr_irq_t *irq, uint32_t value, void *param) {
     (void)param;
     fputc((int)value, stdout);
     fflush(stdout);
+}
+
+// Drain available stdin into the emulated UART and the VPI receive buffer.
+static void poll_stdin(avr_irq_t *uart0_rx) {
+    static int pending_byte = -1;
+    uint8_t ch;
+    unsigned count = 0;
+    while (count < UART_STDIN_BURST && vpi_rx_length(&vpi) < UART_STDIN_BURST) {
+        if (pending_byte >= 0) {
+            ch = (uint8_t)pending_byte;
+            pending_byte = -1;
+        } else if (read(STDIN_FILENO, &ch, 1) != 1) {
+            break;
+        }
+        if (vpi_uart_flow_paused(&vpi) && ch != UART_CTRL_C && ch != UART_CTRL_D &&
+            ch != UART_CTRL_ENTER) {
+            pending_byte = ch;
+            break;
+        }
+        avr_raise_irq(uart0_rx, ch);
+        vpi_rx_push(&vpi, ch);
+        count++;
+    }
 }
 
 // Set by the AVR_CORE_BAD_OPCODE IRQ hook the first time the AVR executes an
@@ -86,6 +121,14 @@ static void msgf(const char *fmt, ...);
 static void snapshot_signal_handler(int signal_number) {
     (void)signal_number;
     snapshot_requested = 1;
+}
+
+/**
+ * Requests a state dump from the SIGUSR2 handler.
+ */
+static void dump_signal_handler(int signal_number) {
+    (void)signal_number;
+    dump_requested = 1;
 }
 
 /**
@@ -147,6 +190,44 @@ static void snapshot_save(const uint8_t *memory) {
     }
     msgf("Snapshot written to %s and %s after %llu instructions\n", json_path, ram_path,
          (unsigned long long)blob.instructions);
+}
+
+/**
+ * Prints the guest state from the snapshot blob in guest RAM.
+ */
+static void state_dump(const uint8_t *memory) {
+    uint32_t offset = RVE_SNAPSHOT_META_ADDRESS - RAM_ORIGIN;
+    uint32_t magic = 0;
+    uint32_t length = 0;
+    memcpy(&magic, &memory[offset], sizeof(magic));
+    memcpy(&length, &memory[offset + 4u], sizeof(length));
+    if (magic != 0x5256534Eu || length != sizeof(rve_snapshot_t)) {
+        msgf("State dump: snapshot blob is not ready\n");
+        return;
+    }
+    rve_snapshot_t blob;
+    memcpy(&blob, &memory[offset + 8u], sizeof(blob));
+    if (blob.magic != RVE_SNAPSHOT_MAGIC || blob.version != RVE_SNAPSHOT_VERSION) {
+        msgf("State dump: incompatible snapshot header\n");
+        return;
+    }
+
+    msgf("=== STATE DUMP after %llu instructions ===\n", (unsigned long long)blob.instructions);
+    msgf("pc=0x%08x next=0x%08x inst=0x%08x priv=%u waiting=%u wfi=%u\n",
+         blob.cpu_pc, blob.cpu_next_pc, blob.cpu_instruction, blob.cpu_privilege,
+         blob.cpu_waiting, blob.cpu_wfi_timeout);
+    msgf("mcause=0x%08x mepc=0x%08x mtval=0x%08x mip=0x%08x mie=0x%08x mip_platform=0x%08x\n",
+         blob.csr_mcause, blob.csr_mepc, blob.csr_mtval, blob.csr_mip, blob.csr_mie,
+         blob.csr_mip_platform);
+    msgf("uart: ier=0x%02x fcr=0x%02x mcr=0x%02x fifo=%u r=%u w=%u overrun=%u\n",
+         blob.uart_ier, blob.uart_fcr, blob.uart_mcr, blob.uart_fifo_count,
+         blob.uart_fifo_read, blob.uart_fifo_write, (unsigned)blob.uart_overrun);
+    msgf("plic: pending=0x%08x enable0=0x%08x threshold0=0x%08x\n",
+         blob.plic_pending, blob.plic_enable[0], blob.plic_threshold[0]);
+    msgf("vpi: rx_head=%u rx_tail=%u rx_len=%u flow=%u\n",
+         (unsigned)vpi.rx_head, (unsigned)vpi.rx_tail,
+         (unsigned)((vpi.rx_tail + VPI_RX_SIZE - vpi.rx_head) % VPI_RX_SIZE),
+         (unsigned)vpi.uart_flow_paused);
 }
 
 /**
@@ -401,12 +482,20 @@ int main(int argc, char *argv[]) {
     if (restore_prefix != NULL) {
         snapshot_load(memory);
     }
-    if (snapshot_prefix != NULL) {
+    {
         struct sigaction action = {0};
-        action.sa_handler = snapshot_signal_handler;
         sigemptyset(&action.sa_mask);
-        if (sigaction(SIGUSR1, &action, NULL) != 0) {
-            msgf("Cannot install the SIGUSR1 handler\n");
+        if (snapshot_prefix != NULL) {
+            action.sa_handler = snapshot_signal_handler;
+            if (sigaction(SIGUSR1, &action, NULL) != 0) {
+                msgf("Cannot install the SIGUSR1 handler\n");
+                free(memory);
+                return EXIT_FAILURE;
+            }
+        }
+        action.sa_handler = dump_signal_handler;
+        if (sigaction(SIGUSR2, &action, NULL) != 0) {
+            msgf("Cannot install the SIGUSR2 handler\n");
             free(memory);
             return EXIT_FAILURE;
         }
@@ -484,14 +573,25 @@ int main(int argc, char *argv[]) {
     unsigned long run_iterations = 0;
     stdin_raw_enable();
     for (;;) {
-        if (vpi_take_snapshot_ready(&vpi) != 0 && snapshot_prefix != NULL) {
-            snapshot_save(memory);
+        if (vpi_take_snapshot_ready(&vpi) != 0) {
+            if (dump_pending != 0) {
+                state_dump(memory);
+                dump_pending = 0;
+            }
+            if (snapshot_prefix != NULL) {
+                snapshot_save(memory);
+            }
         }
         if (snapshot_requested != 0) {
             snapshot_requested = 0;
             if (snapshot_prefix != NULL) {
                 vpi_set_snapshot_request(&vpi, 1);
             }
+        }
+        if (dump_requested != 0) {
+            dump_requested = 0;
+            dump_pending = 1;
+            vpi_set_snapshot_request(&vpi, 1);
         }
         int state = avr_run(avr);
         if (vpi.halted) {
@@ -504,15 +604,11 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
-        // Feed any typed characters into the emulated UART and the VPI
-        // receive buffer. Polling stdin on every avr_run() call slows the
-        // simulation drastically, so only do it once every interval.
+        // Feed typed characters into the emulated UART and the VPI receive
+        // buffer. Poll on an interval so the syscall does not dominate the
+        // simulation.
         if (++run_iterations % UART_STDIN_POLL_INTERVAL == 0) {
-            uint8_t ch;
-            while (read(STDIN_FILENO, &ch, 1) == 1) {
-                avr_raise_irq(uart0_rx, ch);
-                vpi_rx_push(&vpi, ch);
-            }
+            poll_stdin(uart0_rx);
         }
         if (bad_opcode) {
             if (verbose) {

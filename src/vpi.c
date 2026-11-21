@@ -191,6 +191,10 @@ static void execute_call(vpi_t *vpi, uint8_t code) {
             vpi->snapshot_ready = 1;
             break;
 
+        case VPI_CALL_UART_FLOW:
+            vpi->uart_flow_paused = vpi->args[0] != 0;
+            break;
+
         default:
             vpi->status = VPI_STATUS_ERROR;
             if (verbose) {
@@ -327,6 +331,7 @@ void vpi_init(avr_t *avr, vpi_t *vpi) {
     vpi->snapshot_ready = 0;
     vpi->rx_head = 0;
     vpi->rx_tail = 0;
+    vpi->uart_flow_paused = 0;
     vpi->disk_fd = -1;
     vpi->disk_capacity = 0;
     vpi->tap_fd = -1;
@@ -375,6 +380,14 @@ void vpi_rx_push(vpi_t *vpi, uint8_t byte) {
     }
     vpi->rx[vpi->rx_tail] = byte;
     vpi->rx_tail = next;
+}
+
+uint16_t vpi_rx_length(const vpi_t *vpi) {
+    return rx_length(vpi);
+}
+
+uint8_t vpi_uart_flow_paused(const vpi_t *vpi) {
+    return vpi->uart_flow_paused;
 }
 
 uint8_t vpi_get_exit_status(const vpi_t *vpi) {
