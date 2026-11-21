@@ -3,9 +3,11 @@ Copyright Marc Ketel
 SPDX-License-Identifier: Apache-2.0
 */
 
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -23,6 +25,7 @@ SPDX-License-Identifier: Apache-2.0
 #include <simavr/sim_avr.h>
 #include <simavr/sim_elf.h>
 #include <simavr/sim_hex.h>
+#include <simavr/sim_time.h>
 
 #include <RiscvEmulatorSnapshot.h>
 
@@ -33,8 +36,14 @@ SPDX-License-Identifier: Apache-2.0
 #define DTB_ADDRESS 0x82200000u
 #define MAX_LOADS   8
 
+// Upper bound for one host sleep, so signals and -T stay responsive.
+#define HOST_SLEEP_CAP_US 1000000u
+
 static avr_t *avr = NULL;
 static vpi_t vpi;
+static avr_irq_t *uart0_rx = NULL;
+static int pending_byte = -1;
+static bool stdin_pollable = false;
 int verbose = 0; // non-static: also read by vpi.c
 
 #define BREAK_LOOP_THRESHOLD 1000
@@ -80,7 +89,6 @@ static void uart_tx_hook(struct avr_irq_t *irq, uint32_t value, void *param) {
 
 // Drain available stdin into the emulated UART and the VPI receive buffer.
 static void poll_stdin(avr_irq_t *uart0_rx) {
-    static int pending_byte = -1;
     uint8_t ch;
     unsigned count = 0;
     while (count < UART_STDIN_BURST && vpi_rx_length(&vpi) < UART_STDIN_BURST) {
@@ -98,6 +106,37 @@ static void poll_stdin(avr_irq_t *uart0_rx) {
         avr_raise_irq(uart0_rx, ch);
         vpi_rx_push(&vpi, ch);
         count++;
+    }
+}
+
+// Blocks the host while the AVR is sleeping. simavr passes the cycle count
+// until its next timer; the AVR idle tick bounds that wait to about 10 ms.
+static void host_sleep(avr_t *avr, avr_cycle_count_t how_long) {
+    uint32_t usec = avr_cycles_to_usec(avr, how_long);
+    if (usec == 0) {
+        usec = 1;
+    }
+    if (usec > HOST_SLEEP_CAP_US) {
+        usec = HOST_SLEEP_CAP_US;
+    }
+
+    struct timespec timeout = {
+        .tv_sec = (time_t)(usec / 1000000u),
+        .tv_nsec = (long)((usec % 1000000u) * 1000u),
+    };
+
+    // A queued byte must reach linux_tick() before the AVR sleeps again.
+    if (pending_byte >= 0 || vpi_rx_length(&vpi) != 0) {
+        return;
+    }
+    if (!stdin_pollable) {
+        (void)nanosleep(&timeout, NULL);
+        return;
+    }
+
+    struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+    if (ppoll(&pfd, 1, &timeout, NULL) > 0 && (pfd.revents & POLLIN) != 0) {
+        poll_stdin(uart0_rx);
     }
 }
 
@@ -334,6 +373,10 @@ static void stdin_raw_enable(void) {
         (void)fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     }
 
+    struct stat st;
+    stdin_pollable = fstat(STDIN_FILENO, &st) == 0 &&
+                     (isatty(STDIN_FILENO) != 0 || S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode));
+
     stdin_is_tty = isatty(STDIN_FILENO);
     if (!stdin_is_tty) {
         return;
@@ -455,6 +498,7 @@ int main(int argc, char *argv[]) {
     }
 
     avr_init(avr);
+    avr->sleep = host_sleep;
 
     uint8_t *memory = malloc(RAM_LENGTH);
     if (memory == NULL) {
@@ -548,8 +592,7 @@ int main(int argc, char *argv[]) {
     }
     avr_irq_register_notify(uart0_tx, uart_tx_hook, NULL);
 
-    avr_irq_t *uart0_rx =
-        avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'), UART_IRQ_INPUT);
+    uart0_rx = avr_io_getirq(avr, AVR_IOCTL_UART_GETIRQ('0'), UART_IRQ_INPUT);
     if (uart0_rx == NULL) {
         msgf("Error: UART0 RX IRQ not found\n");
         return EXIT_FAILURE;
@@ -597,7 +640,7 @@ int main(int argc, char *argv[]) {
         if (vpi.halted) {
             break;
         }
-        if (state == cpu_Sleeping || state == cpu_Crashed || state == cpu_Done) {
+        if (state == cpu_Crashed || state == cpu_Done) {
             if (verbose) {
                 msgf("Verbose: run loop ended with CPU state %d at pc 0x%04x\n",
                      state, avr->pc);

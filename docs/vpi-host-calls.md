@@ -59,4 +59,4 @@ The host writes `SNAPSHOT` to request a state transfer. For a save, the firmware
 
 ## Receive path
 
-The host main loop polls stdin and appends bytes to a 1024-byte receive buffer. The AVR polls `RX_LEN` and drains `RX_DATA`. Network receive uses the same buffer with a two-byte little-endian frame length followed by the frame bytes.
+The host polls stdin from the run loop and from simavr's sleep callback while the AVR is idle, and appends bytes to a 1024-byte receive buffer. The AVR polls `RX_LEN` and drains `RX_DATA`. Network receive uses the same buffer with a two-byte little-endian frame length followed by the frame bytes.
